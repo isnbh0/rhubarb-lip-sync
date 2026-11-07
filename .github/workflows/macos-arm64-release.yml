@@ -1,0 +1,91 @@
+name: macOS arm64 release
+
+# Builds the unmodified upstream source of this branch's base tag natively on an
+# Apple Silicon runner and publishes it as a release with a checksum and a build
+# provenance attestation. Triggered by pushing a tag named arm64-v<version>.
+
+on:
+  push:
+    tags: ["arm64-v*"]
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+          lfs: true
+
+      - name: Install build dependencies
+        run: |
+          brew install boost ninja
+          echo "BOOST_VERSION=$(brew list --versions boost | awk '{print $2}')" >> "$GITHUB_ENV"
+          echo "VERSION=${GITHUB_REF_NAME#arm64-v}" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64
+          cmake --build build --target rhubarb runTests
+
+      - name: Run the upstream tests
+        run: ./build/rhubarb/runTests
+
+      # The Spine extra's Gradle build depends on tornadofx 2.0.0-SNAPSHOT, which no
+      # repository serves anymore. Its jar is platform-independent Java, so the
+      # package takes it from the official release of the same version.
+      - name: Take the Spine extra from the official release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          official="Rhubarb-Lip-Sync-${VERSION}-macOS.zip"
+          gh release download "v${VERSION}" --repo DanielSWolf/rhubarb-lip-sync --pattern "$official" --dir official
+          echo "OFFICIAL_SHA256=$(shasum -a 256 "official/$official" | awk '{print $1}')" >> "$GITHUB_ENV"
+          unzip -q "official/$official" -d official
+          mkdir -p extras/EsotericSoftwareSpine/build/libs
+          cp official/*/extras/EsotericSoftwareSpine/*.jar extras/EsotericSoftwareSpine/build/libs/
+
+      - name: Package and check
+        run: |
+          (cd build && cpack)
+          cd build
+          zip="Rhubarb-Lip-Sync-${VERSION}-macOS-arm64.zip"
+          mv "Rhubarb-Lip-Sync-${VERSION}-macOS.zip" "$zip"
+          rm -rf check && mkdir check && unzip -q "$zip" -d check
+          diff <(cd check/* && find . -type f | sort) <(cd "../official/Rhubarb-Lip-Sync-${VERSION}-macOS" && find . -type f | sort)
+          binary=$(find check -name rhubarb -type f -perm +111 | head -1)
+          file "$binary" | tee /dev/stderr | grep -q "arm64"
+          "$binary" --version | grep -q "version ${VERSION}"
+          "$binary" -q -f json ../rhubarb/tests/resources/sine-triangle-int16-ffmpeg.wav > /dev/null
+          shasum -a 256 "$zip" > "$zip.sha256"
+          echo "ZIP=build/$zip" >> "$GITHUB_ENV"
+
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ env.ZIP }}
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          base=$(git rev-parse HEAD^)
+          name=$(basename "$ZIP")
+          cat > notes.md <<EOF
+          Unofficial native Apple Silicon (arm64) build of [Rhubarb Lip Sync](https://github.com/DanielSWolf/rhubarb-lip-sync) ${VERSION}. The official ${VERSION} macOS release is x86_64 only and runs through Rosetta.
+
+          - **Source:** upstream tag \`v${VERSION}\` (commit \`${base}\`), unmodified. This branch adds the workflow that builds it and removes the upstream CI workflow so only this build runs.
+          - **Built by:** [this workflow run](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) on GitHub's \`macos-latest\` Apple Silicon runner, with Homebrew Boost ${BOOST_VERSION}. The upstream test suite passed.
+          - **Spine extra:** its Gradle build no longer resolves a snapshot dependency, so \`extras/EsotericSoftwareSpine\` holds the platform-independent jar from the official ${VERSION} macOS zip (SHA-256 \`${OFFICIAL_SHA256}\`). The package has the same files as the official one.
+          - **Verify:** \`shasum -a 256 -c ${name}.sha256\` and \`gh attestation verify ${name} --repo ${GITHUB_REPOSITORY}\`.
+          - **Not signed or notarized.** After downloading through a browser, clear the quarantine flag: \`xattr -dr com.apple.quarantine <unzipped folder>\`.
+
+          Rhubarb Lip Sync is by Daniel Wolf and released under the MIT License (included in the zip). This build is not affiliated with or endorsed by the upstream project; for official releases, see [upstream releases](https://github.com/DanielSWolf/rhubarb-lip-sync/releases).
+          EOF
+          gh release create "$GITHUB_REF_NAME" "$ZIP" "$ZIP.sha256" \
+            --title "Rhubarb Lip Sync ${VERSION} for macOS arm64 (unofficial build)" \
+            --notes-file notes.md
